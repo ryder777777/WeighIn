@@ -102,3 +102,40 @@ test('fee-only configuration/metadata changes remain visible without invalidatin
   assert.equal(diff.hasRegression, false);
   assert.notEqual(diff.contracts[0].functions[0].base_provenance.config_sha256, diff.contracts[0].functions[0].head_provenance.config_sha256);
 });
+
+test('enforceThresholds rejects contradictory derived delta/regression flags in DiffResult (#228)', () => {
+  const { enforceThresholds } = require('../dist/threshold');
+  const badDiff = {
+    newContracts: [],
+    removedContracts: [],
+    contracts: [
+      {
+        contract_id: 'C1',
+        base_contract_id: 'C1',
+        head_contract_id: 'C1',
+        newBenchmarks: [],
+        removedBenchmarks: [],
+        functions: [
+          {
+            function_name: 'invoke',
+            metrics: [
+              {
+                key: 'cpu_instructions',
+                availability: 'available',
+                base: { consumed: 100, limit: 1000 },
+                head: { consumed: 200, limit: 1000 },
+                delta: 100,
+                pct: 100,
+                regression: false, // Contradicts positive delta!
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+  assert.throws(
+    () => enforceThresholds(badDiff, { thresholds: { global: { fail_on_any_regression: true } } }),
+    /contradictory regression flag/,
+  );
+});

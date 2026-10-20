@@ -54553,7 +54553,59 @@ var GLOBAL_RULE_MAP = [
     toRule: (v) => v
   }
 ];
+function validateDiffResultForEnforcement(diff) {
+  if (!diff || typeof diff !== "object" || !Array.isArray(diff.contracts)) {
+    throw new Error("Invalid DiffResult: contracts array is required");
+  }
+  for (const contract of diff.contracts) {
+    if (!contract || typeof contract.contract_id !== "string" || !Array.isArray(contract.functions)) {
+      throw new Error("Invalid DiffResult: contract entry is malformed");
+    }
+    for (const fn of contract.functions) {
+      if (!fn || typeof fn.function_name !== "string" || !Array.isArray(fn.metrics)) {
+        throw new Error(
+          `Invalid DiffResult: function entry in ${contract.contract_id} is malformed`
+        );
+      }
+      for (const m of fn.metrics) {
+        if (!METRIC_KEYS.includes(m.key)) {
+          throw new Error(
+            `Invalid DiffResult: unsupported metric key "${String(m.key)}"`
+          );
+        }
+        if (m.availability === "unavailable") {
+          if (m.delta !== null || m.pct !== null || m.regression !== false) {
+            throw new Error(
+              `Invalid DiffResult: unavailable metric ${m.key} on ${fn.function_name} must have null delta/pct and regression=false`
+            );
+          }
+          continue;
+        }
+        const baseVal = m.base?.consumed;
+        const headVal = m.head?.consumed;
+        if (typeof baseVal !== "number" || !Number.isFinite(baseVal) || baseVal < 0 || typeof headVal !== "number" || !Number.isFinite(headVal) || headVal < 0) {
+          throw new Error(
+            `Invalid DiffResult: available metric ${m.key} on ${fn.function_name} requires finite non-negative base/head consumed values`
+          );
+        }
+        const expectedDelta = headVal - baseVal;
+        if (m.delta !== expectedDelta) {
+          throw new Error(
+            `Invalid DiffResult: metric ${m.key} on ${fn.function_name} has contradictory delta (${String(m.delta)} !== ${expectedDelta})`
+          );
+        }
+        const expectedRegression = expectedDelta > 0;
+        if (m.regression !== expectedRegression) {
+          throw new Error(
+            `Invalid DiffResult: metric ${m.key} on ${fn.function_name} has contradictory regression flag (${String(m.regression)} !== ${expectedRegression})`
+          );
+        }
+      }
+    }
+  }
+}
 function enforceThresholds(diff, config2) {
+  validateDiffResultForEnforcement(diff);
   if (config2 !== null) config2 = validateConfig(config2);
   if (!config2?.thresholds && !config2?.limits) return [];
   const global2 = config2?.thresholds?.global ?? {};
