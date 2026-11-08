@@ -2,10 +2,13 @@ import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 import { parseFixtures } from "./identity";
+import { discoverSdkVersion } from "./sdk-version";
 import { ensureAccountReady } from "./account";
+import { acquireDeployerKey } from "./deployer-key";
 import { redactEndpointSecrets, sanitizeEndpoint } from "./endpoint";
 import { validateLargeInt } from "./config";
 import { SUPPORTED_NETWORK_PASSPHRASE } from "./network";
+import { CURRENT_RECORD_SCHEMA_VERSION } from "./record-schema";
 import {
   measureInvocation,
   resolveSimulationHelper,
@@ -14,6 +17,8 @@ import {
   SimulationOutput,
   ResourceLimits,
 } from "./simulation";
+import { planSetupOrder, dependentsOf, resolveBinding } from "./setup-plan";
+import type { SetupResult } from "./setup-plan";
 import {
   xdr,
   nativeToScVal,
@@ -30,7 +35,7 @@ import {
 
 const DEFAULT_RPC_URL = "http://localhost:8000/rpc";
 
-/** Schema 4 adds audited consumption and per-metric limit provenance. */
+/** Schema 5 binds each metric to its approved source and cap mapping. */
 export interface MetricValue {
   availability?: "measured" | "unavailable";
   consumed: number | null;
@@ -66,7 +71,7 @@ export interface BenchmarkResult {
 
 export interface ContractBenchmark {
   /** Versions 2–4 separate logical comparison identity from deployment identity. */
-  schema_version?: 2 | 3 | 4;
+  schema_version?: 2 | 3 | 4 | 5;
   fixture_id?: string;
   logical_id?: string;
   /** Runtime address, never the comparison key for logical results. */
@@ -82,15 +87,30 @@ export interface InvocationArg {
   value: any;
 }
 
+export type BindingSelectorStep = { field: string } | { index: number };
+
+/** Reference to a declared dependency's committed setup return. */
+export interface SetupBinding {
+  contract: string;
+  select?: BindingSelectorStep[];
+}
+
+export interface BoundInvocationArg {
+  type: string;
+  binding: SetupBinding;
+}
+
 export interface InvocationSpec {
   id?: string;
   function_name: string;
-  args: InvocationArg[];
+  args: Array<InvocationArg | BoundInvocationArg>;
 }
 
 export interface ContractSpec {
   id?: string;
   wasm_path: string;
+  /** Explicit ids of contracts that must be committed before this one. */
+  depends_on?: string[];
   invocations: InvocationSpec[];
 }
 
@@ -432,7 +452,7 @@ async function submitAndConfirm(
   phase: string,
   rpcUrl: string,
   signal?: AbortSignal,
-): Promise<void> {
+): Promise<rpc.Api.GetSuccessfulTransactionResponse> {
   if (signal?.aborted) {
     throw signal.reason || new Error(`${phase} cancelled`);
   }
@@ -474,16 +494,22 @@ async function submitAndConfirm(
       `${phase} transaction ${submission.hash} did not succeed (status=${confirmed.status})`,
     );
   }
+  return confirmed;
 }
 
-export const MIN_REUSABLE_CONTRACT_TTL_LEDGERS = 100;
+// Check if contract is already deployed
+export interface ContractInstanceProbe {
+  deployed: boolean;
+  /** Ledger through which the instance entry is live (when deployed). */
+  liveUntilLedgerSeq?: number;
+  /** Latest ledger reported by the RPC for this probe. */
+  latestLedger?: number;
+}
 
-// Check if contract is already deployed and has sufficient remaining TTL window
-export async function isContractDeployed(
+export async function probeContractInstance(
   server: rpc.Server,
   contractId: string,
-  minTtlLedgers: number = MIN_REUSABLE_CONTRACT_TTL_LEDGERS,
-): Promise<boolean> {
+): Promise<ContractInstanceProbe> {
   const contractScAddress = Address.fromString(contractId).toScAddress();
   const ledgerKey = xdr.LedgerKey.contractData(
     new xdr.LedgerKeyContractData({
@@ -495,23 +521,120 @@ export async function isContractDeployed(
 
   try {
     const res = await server.getLedgerEntries(ledgerKey);
-    if (!res.entries || res.entries.length === 0) {
-      return false;
-    }
-    const entry = res.entries[0] as any;
-    const liveUntil = entry?.liveUntilLedgerSeq;
-    const latestLedger = (res as any)?.latestLedger;
     if (
-      typeof liveUntil === "number" &&
-      typeof latestLedger === "number" &&
-      liveUntil < latestLedger + minTtlLedgers
+      !res ||
+      typeof res !== "object" ||
+      !Array.isArray((res as any).entries)
     ) {
-      return false;
+      throw new Error(
+        `Deployment probe returned an invalid ledger response: ${JSON.stringify(res)}`,
+      );
     }
-    return true;
-  } catch {
-    return false;
+
+    if (res.entries.length === 0) {
+      return { deployed: false, latestLedger: (res as any).latestLedger };
+    }
+    if (res.entries.length > 1) {
+      throw new Error(
+        `Deployment probe returned ${res.entries.length} entries for ${contractId}; expected at most one matching contract instance`,
+      );
+    }
+
+    const entry = res.entries[0] as any;
+    if (!entry || typeof entry !== "object") {
+      throw new Error(
+        `Deployment probe returned a malformed entry for ${contractId}: ${JSON.stringify(entry)}`,
+      );
+    }
+    const entryKey =
+      typeof entry.key === "string"
+        ? entry.key
+        : typeof entry.key?.toXDR === "function"
+          ? entry.key.toXDR("base64")
+          : undefined;
+    const entryValue = entry.xdr ?? entry.val;
+    const entryXdr =
+      typeof entryValue === "string"
+        ? entryValue
+        : typeof entryValue?.toXDR === "function"
+          ? entryValue.toXDR("base64")
+          : undefined;
+    if (typeof entryKey !== "string" || typeof entryXdr !== "string") {
+      throw new Error(
+        `Deployment probe returned a missing key/xdr payload for ${contractId}: ${JSON.stringify(entry)}`,
+      );
+    }
+    if (entryKey !== ledgerKey.toXDR("base64")) {
+      throw new Error(
+        `Deployment probe returned an unrelated ledger entry for ${contractId}; expected instance key ${ledgerKey.toXDR("base64")}, got ${entryKey}`,
+      );
+    }
+
+    let ledgerEntry: xdr.LedgerEntryData;
+    try {
+      ledgerEntry = xdr.LedgerEntryData.fromXDR(entryXdr, "base64");
+    } catch (error: any) {
+      throw new Error(
+        `Deployment probe returned invalid XDR for ${contractId}: ${error.message}`,
+      );
+    }
+
+    if (ledgerEntry.switch().name !== "contractData") {
+      throw new Error(
+        `Deployment probe returned ${ledgerEntry.switch().name} for ${contractId}; expected contractData`,
+      );
+    }
+
+    const contractData = ledgerEntry.contractData();
+    if (!contractData) {
+      throw new Error(
+        `Deployment probe returned a contractData record without payload for ${contractId}`,
+      );
+    }
+    const instanceKey = contractData.key();
+    if (
+      instanceKey.toXDR("base64") !==
+      xdr.ScVal.scvLedgerKeyContractInstance().toXDR("base64")
+    ) {
+      throw new Error(
+        `Deployment probe returned a non-instance contractData entry for ${contractId}`,
+      );
+    }
+    if (
+      contractData.contract().toXDR("base64") !==
+      contractScAddress.toXDR("base64")
+    ) {
+      throw new Error(
+        `Deployment probe returned a different contract for ${contractId}; expected ${contractScAddress.toXDR("base64")}`,
+      );
+    }
+
+    return {
+      deployed: true,
+      liveUntilLedgerSeq: entry.liveUntilLedgerSeq,
+      latestLedger: (res as any).latestLedger,
+    };
+  } catch (error: any) {
+    if (
+      error instanceof Error &&
+      error.message.startsWith("Deployment probe")
+    ) {
+      throw error;
+    }
+    throw new Error(
+      `Deployment probe failed for contract ${contractId}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
   }
+}
+
+/** Presence-only check; see probeContractInstance for TTL metadata. */
+export async function isContractDeployed(
+  server: rpc.Server,
+  contractId: string,
+): Promise<boolean> {
+  return (await probeContractInstance(server, contractId)).deployed;
 }
 
 /** Resolve a declared wasm_path against the fixtures directory.
@@ -541,8 +664,72 @@ export function resolveContractWasmPath(
   return resolved;
 }
 
+/** Minimum remaining TTL (ledgers) a reused contract must have before a
+ *  benchmark is invoked. 17,280 ledgers is about one day at 5s per ledger. */
+export const DEFAULT_MIN_CONTRACT_TTL_LEDGERS = 17_280;
+
+/** Reject an unusable minimum TTL window before any network work. */
+export function assertValidMinTtl(value: unknown): void {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new Error(`Invalid minimum contract TTL window: ${String(value)}`);
+  }
+}
+
+export function assertReusableTtl(args: {
+  label: string;
+  contractId: string;
+  liveUntilLedgerSeq: unknown;
+  latestLedger: unknown;
+  minTtlLedgers: number;
+}): void {
+  const { label, contractId, liveUntilLedgerSeq, latestLedger, minTtlLedgers } =
+    args;
+  assertValidMinTtl(minTtlLedgers);
+  if (
+    typeof liveUntilLedgerSeq !== "number" ||
+    typeof latestLedger !== "number"
+  ) {
+    throw new Error(
+      `Deployment probe returned no TTL metadata for the ${label} of ${contractId}; cannot verify the ${minTtlLedgers}-ledger minimum window`,
+    );
+  }
+  const remaining = liveUntilLedgerSeq - latestLedger;
+  if (remaining < minTtlLedgers) {
+    throw new Error(
+      `Reusable contract ${contractId} ${label} expires too soon: live until ledger ${liveUntilLedgerSeq}, latest ledger ${latestLedger} (${remaining} ledgers remaining, minimum ${minTtlLedgers}). Refusing to benchmark; WeighIn does not extend TTLs or restore archived state. Extend the TTL externally or deploy under a different deployer key.`,
+    );
+  }
+}
+
+async function probeContractCode(
+  server: rpc.Server,
+  wasmHash: Buffer,
+  contractId: string,
+): Promise<{ liveUntilLedgerSeq: unknown; latestLedger: unknown }> {
+  const key = xdr.LedgerKey.contractCode(
+    new xdr.LedgerKeyContractCode({ hash: wasmHash }),
+  );
+  const res: any = await server.getLedgerEntries(key);
+  if (!res || !Array.isArray(res.entries)) {
+    throw new Error(
+      `Deployment probe returned an invalid ledger response for the contract code of ${contractId}`,
+    );
+  }
+  if (res.entries.length !== 1) {
+    throw new Error(
+      `Deployment probe found ${res.entries.length} contract code entries for ${contractId}; expected exactly one (the code entry may be expired or archived)`,
+    );
+  }
+  return {
+    liveUntilLedgerSeq: res.entries[0].liveUntilLedgerSeq,
+    latestLedger: res.latestLedger,
+  };
+}
+
 /** Upload the WASM and create the contract instance when it is not deployed.
  *  Deployment always uses the deployer account, never an invocation source.
+ *  Returns the committed create return XDR, or the verified instance address
+ *  when the instance already existed.
  */
 export async function ensureContractDeployed(options: {
   server: rpc.Server;
@@ -554,13 +741,39 @@ export async function ensureContractDeployed(options: {
   contractId: string;
   rpcUrl: string;
   signal?: AbortSignal;
-}): Promise<void> {
+  /** Minimum remaining TTL (ledgers) for a reused instance and its code. */
+  minTtlLedgers?: number;
+}): Promise<Pick<SetupResult, "source" | "return_xdr">> {
   const { server, deployer, deployerAddress, wasmBytes, wasmHash, salt } =
     options;
-  const deployed = await isContractDeployed(server, options.contractId);
-  if (deployed) {
+  if (options.minTtlLedgers !== undefined) {
+    assertValidMinTtl(options.minTtlLedgers);
+  }
+  const probe = await probeContractInstance(server, options.contractId);
+  if (probe.deployed) {
+    const minTtlLedgers =
+      options.minTtlLedgers ?? DEFAULT_MIN_CONTRACT_TTL_LEDGERS;
+    assertReusableTtl({
+      label: "instance",
+      contractId: options.contractId,
+      liveUntilLedgerSeq: probe.liveUntilLedgerSeq,
+      latestLedger: probe.latestLedger,
+      minTtlLedgers,
+    });
+    const code = await probeContractCode(server, wasmHash, options.contractId);
+    assertReusableTtl({
+      label: "code",
+      contractId: options.contractId,
+      ...code,
+      minTtlLedgers,
+    });
     console.log(`Already deployed at ${options.contractId}`);
-    return;
+    return {
+      source: "existing_instance",
+      return_xdr: Address.fromString(options.contractId)
+        .toScVal()
+        .toXDR("base64"),
+    };
   }
 
   console.log(`Installing WASM...`);
@@ -613,7 +826,7 @@ export async function ensureContractDeployed(options: {
 
   const preparedCreate = await server.prepareTransaction(createTx);
   preparedCreate.sign(deployer);
-  await submitAndConfirm(
+  const created = await submitAndConfirm(
     server,
     preparedCreate,
     "contract creation",
@@ -621,11 +834,16 @@ export async function ensureContractDeployed(options: {
     options.signal,
   );
   console.log(`Deployed at ${options.contractId}`);
+  return {
+    source: "created",
+    return_xdr: created.returnValue?.toXDR("base64"),
+  };
 }
 
 /** Build the simulated invocation transaction for one contract case.
  *  The transaction source account selects the invoking identity; it is never
  *  a signing key, because benchmark invocations are simulated, not submitted.
+ *  Bound arguments are resolved from setupResults, keyed by explicit contract id.
  */
 export async function buildInvocationTransaction(options: {
   server: rpc.Server;
@@ -634,6 +852,7 @@ export async function buildInvocationTransaction(options: {
   invocation: InvocationSpec;
   rpcUrl: string;
   signal?: AbortSignal;
+  setupResults?: ReadonlyMap<string, SetupResult>;
 }): Promise<Transaction> {
   const { server, sourceAccount, contractId, invocation } = options;
   if (options.signal?.aborted) {
@@ -647,7 +866,19 @@ export async function buildInvocationTransaction(options: {
       `Invocation source account is not available on the network: ${sourceAccount} (${redactEndpointSecrets(String(err?.message ?? err), options.rpcUrl)})`,
     );
   }
-  const argsSc = invocation.args.map(toScVal);
+  const argsSc = invocation.args.map((arg) => {
+    if (!("binding" in arg)) return toScVal(arg);
+    if (!options.setupResults) {
+      throw new Error(
+        `Setup bindings are not available in this measurement path: ${invocation.function_name} binds "${arg.binding.contract}"`,
+      );
+    }
+    return resolveBinding(
+      arg.binding,
+      arg.type.toLowerCase(),
+      options.setupResults.get(arg.binding.contract),
+    );
+  });
   return new TransactionBuilder(account, {
     fee: "1000000",
     networkPassphrase: SUPPORTED_NETWORK_PASSPHRASE,
@@ -677,15 +908,29 @@ export interface RunMeasurementOptions {
    */
   fixtureId?: string;
   gitCommit: string;
-  sdkVersion: string;
+  /**
+   * SDK metadata reported on every contract record.
+   * Caller-supplied: when supplied, this value is used verbatim for all
+   * records (the GitHub Action passes an explicitly discovered value this
+   * way). When omitted, each record's `soroban_sdk_version` is discovered
+   * independently from the Cargo workspace/lock owning that contract's WASM
+   * artifact (see `discoverSdkVersion` in `./sdk-version`); unresolved
+   * associations report `"unknown"`. Discovered metadata is best-effort
+   * filesystem data: it is read from lockfiles on disk, never from RPC, and
+   * does not prove how a prebuilt WASM was compiled.
+   */
+  sdkVersion?: string;
   /** Soroban RPC endpoint. Defaults to localhost:8000/rpc. */
   rpcUrl?: string;
   /**
-   * Absolute path to a file used to persist the deployer keypair between
-   * base and head runs so both use the same funded on-chain account.
-   * Defaults to <fixturesDir>/.weighin-temp-key
+   * Absolute path to a reusable file that persists the deployer keypair
+   * between base and head runs so both use the same funded on-chain account.
+   * Caller-supplied files are never deleted. When omitted, the run uses a
+   * private temporary key that is removed when the run finishes or fails.
    */
   keyFile?: string;
+  /** Minimum remaining TTL (ledgers) required to reuse a deployed contract. */
+  minTtlLedgers?: number;
   /** Executable override; otherwise build the bundled pinned helper on Linux x64. */
   helperPath?: string;
   /**
@@ -839,7 +1084,7 @@ export async function runMeasurement(
     opts = {
       fixturesPath: fixturesPathOrOptions,
       gitCommit: gitCommit ?? "unknown",
-      sdkVersion: sdkVersion ?? "unknown",
+      sdkVersion: sdkVersion,
       rpcUrl,
     };
   } else {
@@ -850,15 +1095,38 @@ export async function runMeasurement(
     throw opts.signal.reason || new Error("Measurement cancelled by caller");
   }
 
+  // Reject an unusable TTL window before reading fixtures, creating a key or
+  // touching the network.
+  if (opts.minTtlLedgers !== undefined) {
+    assertValidMinTtl(opts.minTtlLedgers);
+  }
+
+  const lease = await acquireDeployerKey(opts.keyFile);
+  try {
+    return await measureWithKeyFile(opts, lease.keyFile);
+  } finally {
+    await lease.release();
+  }
+}
+
+async function measureWithKeyFile(
+  opts: RunMeasurementOptions,
+  keyFile: string,
+): Promise<ContractBenchmark[]> {
   const effectiveRpcUrl = opts.rpcUrl ?? DEFAULT_RPC_URL;
   const fixturesDir = path.dirname(path.resolve(opts.fixturesPath));
-  const keyFile = opts.keyFile ?? path.join(fixturesDir, ".weighin-temp-key");
 
   const rawFixtures = fs.readFileSync(opts.fixturesPath, "utf8");
   const fixturesSpec = parseFixtures(
     rawFixtures,
     opts.fixtureId ??
       path.relative(process.cwd(), path.resolve(opts.fixturesPath)),
+  );
+
+  // Validate dependency references, bindings and cycles before any side effect.
+  const setupOrder = planSetupOrder(
+    fixturesSpec.fixture_id,
+    fixturesSpec.contracts,
   );
 
   // Preflight every configured contract WASM BEFORE funding or deploying anything (#119, #120)
@@ -889,9 +1157,14 @@ export async function runMeasurement(
     }
   }
 
-  const results: ContractBenchmark[] = [];
-
-  for (const contractSpec of fixturesSpec.contracts) {
+  // Setup phase: commit every deployment in dependency order before any
+  // measured invocation. A failed prerequisite aborts all of its dependents.
+  const setupResults = new Map<string, SetupResult>();
+  const deployments = new Map<
+    string,
+    { contractId: string; wasmSha256: string }
+  >();
+  for (const contractSpec of setupOrder) {
     const wasmPath = resolvedWasmPaths.get(contractSpec.wasm_path)!;
     const wasmBytes = fs.readFileSync(wasmPath);
     const wasmHash = crypto.createHash("sha256").update(wasmBytes).digest();
@@ -905,17 +1178,45 @@ export async function runMeasurement(
     const contractId = calculateContractId(deployer.publicKey(), salt);
 
     console.log(`Contract ID: ${contractId}`);
-    await ensureContractDeployed({
-      server,
-      deployer,
-      deployerAddress,
-      wasmBytes,
-      wasmHash,
-      salt,
-      contractId,
-      rpcUrl: effectiveRpcUrl,
-      signal: opts.signal,
-    });
+    let receipt: Pick<SetupResult, "source" | "return_xdr">;
+    try {
+      receipt = await ensureContractDeployed({
+        server,
+        deployer,
+        deployerAddress,
+        wasmBytes,
+        wasmHash,
+        salt,
+        contractId,
+        rpcUrl: effectiveRpcUrl,
+        signal: opts.signal,
+        minTtlLedgers: opts.minTtlLedgers,
+      });
+    } catch (err) {
+      const aborted = dependentsOf(contractSpec, setupOrder);
+      if (opts.signal?.aborted || aborted.length === 0) throw err;
+      throw new Error(
+        `${err instanceof Error ? err.message : String(err)}\nSetup of ${contractSpec.logical_id} failed; aborted dependents: ${aborted.map((contract) => contract.logical_id).join(", ")}`,
+        { cause: err },
+      );
+    }
+    deployments.set(contractSpec.logical_id, { contractId, wasmSha256 });
+    if (contractSpec.id !== undefined) {
+      setupResults.set(contractSpec.id, {
+        logical_id: contractSpec.logical_id,
+        contract_id: contractId,
+        ...receipt,
+      });
+    }
+  }
+
+  // Measurement phase, in fixture declaration order.
+  const results: ContractBenchmark[] = [];
+  for (const contractSpec of fixturesSpec.contracts) {
+    const wasmPath = resolvedWasmPaths.get(contractSpec.wasm_path)!;
+    const { contractId, wasmSha256 } = deployments.get(
+      contractSpec.logical_id,
+    )!;
 
     const benchmarks: BenchmarkResult[] = [];
 
@@ -934,26 +1235,19 @@ export async function runMeasurement(
         invocation: invokeSpec,
         rpcUrl: effectiveRpcUrl,
         signal: opts.signal,
+        setupResults,
       });
 
-      const simRes = await server.simulateTransaction(invokeTx);
-      if (rpc.Api.isSimulationError(simRes)) {
-        throw new Error(
-          `Simulation failed for ${invokeSpec.function_name}: ${simRes.error}`,
-        );
-      }
-
-      if (!rpc.Api.isSimulationSuccess(simRes)) {
-        throw new Error(
-          `Simulation did not return transaction data for ${invokeSpec.function_name}`,
-        );
-      }
       const helperPath = await resolveSimulationHelper(opts.helperPath);
       const { output, provenance, limits } = await measureInvocation(
         effectiveRpcUrl,
         invokeTx,
         helperPath,
-        { signal: opts.signal },
+        {
+          signal: opts.signal,
+          functionName: invokeSpec.function_name,
+          caseId: invokeSpec.case_id,
+        },
       );
       const metrics = metricsFromSimulation(output, limits);
 
@@ -966,13 +1260,18 @@ export async function runMeasurement(
       });
     }
 
+    const sorobanSdkVersion =
+      opts.sdkVersion !== undefined
+        ? opts.sdkVersion
+        : discoverSdkVersion(wasmPath);
+
     results.push({
-      schema_version: 4,
+      schema_version: CURRENT_RECORD_SCHEMA_VERSION,
       fixture_id: fixturesSpec.fixture_id,
       logical_id: contractSpec.logical_id,
       contract_id: contractId,
       git_commit: opts.gitCommit,
-      soroban_sdk_version: opts.sdkVersion,
+      soroban_sdk_version: sorobanSdkVersion,
       timestamp: Math.floor(Date.now() / 1000),
       benchmarks,
     });
@@ -1003,3 +1302,12 @@ export {
   SingleRecordValidationResult,
   RecordValidationResult,
 } from "./record-schema";
+export type { SdkAssociation } from "./sdk-version";
+export {
+  discoverSdkAssociations,
+  discoverSdkVersion,
+  findOwningLock,
+  formatSdkVersions,
+  parseSdkVersionsFromLock,
+  readSdkVersionsFromLock,
+} from "./sdk-version";

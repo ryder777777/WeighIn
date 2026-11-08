@@ -283,6 +283,21 @@ test("Action rejects a healthy but unsupported RPC network before builds or fund
   }
 });
 
+test("Action refuses to measure a HEAD checkout with uncommitted changes", () => {
+  const result = action("dirty-head");
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  assert.match(result.summary, /HEAD workspace has uncommitted changes/);
+  assert.match(result.summary, /contract\/src\/lib\.rs/);
+  assert.equal(result.keyPaths.length, 0, "no account may be funded for a dirty checkout");
+  assert.deepEqual(result.builds, [], "no contract may be built for a dirty checkout");
+});
+
+test("Action measures a HEAD checkout that only contains untracked files", () => {
+  const result = action("untracked-head");
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(result.keyPaths.length, 2, "both revisions are measured");
+});
+
 test("Action validates supported baseline branch, tag, and SHA forms", () => {
   for (const ref of ["feature/topic", "v1.2.3", "0123456789abcdef0123456789abcdef01234567"]) {
     const result = action("control", policy, null, null, "fixtures.json", undefined, ref);
@@ -649,4 +664,38 @@ test("Action rejects unknown fixture root field before build or deployment", () 
   ).finally(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
   return p.catch(() => {}); // let the test runner see it resolved
+});
+
+test("Action rejects a report-path that aliases the fixtures file and leaves it untouched", () => {
+  const result = action("measurement", policy, null, "fixtures.json");
+  assert.equal(result.status, 1);
+  assert.match(result.summary, /must not resolve to the same path/);
+  assert.doesNotMatch(result.reportContent ?? "", /Unsuccessful Comparison/);
+  assert.ok(JSON.parse(result.reportContent).contracts.length > 0);
+});
+
+test("Action rejects a report-path symlink to the fixtures file and leaves it untouched", () => {
+  const result = action(
+    "measurement",
+    policy,
+    null,
+    "link.md",
+    "fixtures.json",
+    ({ head }) => fs.symlinkSync(path.join(head, "fixtures.json"), path.join(head, "link.md")),
+  );
+  assert.equal(result.status, 1);
+  assert.match(result.summary, /symbolic link/);
+  assert.ok(JSON.parse(result.reportContent).contracts.length > 0);
+});
+
+test("Action rejects report-path and metadata-path that resolve to the same file", () => {
+  process.env["INPUT_METADATA-PATH"] = "same.out";
+  try {
+    const result = action("measurement", policy, null, "same.out");
+    assert.equal(result.status, 1);
+    assert.match(result.summary, /must not resolve to the same path/);
+    assert.doesNotMatch(result.reportContent ?? "", /Unsuccessful Comparison/);
+  } finally {
+    delete process.env["INPUT_METADATA-PATH"];
+  }
 });
