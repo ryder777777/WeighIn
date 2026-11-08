@@ -70,6 +70,14 @@ An explicit ID is the caller's assertion of continuity across revisions.
 `src/measurement.ts::runMeasurement` hashes the WASM. That hash determines the
 deployment salt; the address also depends on the deployer and standalone network
 ID. The same WASM may reuse a deployment; changed WASM can change the address.
+A reused deployment is checked before any benchmark is invoked: its instance
+entry and its contract-code entry must each have at least `minTtlLedgers`
+ledgers of TTL remaining (default 17,280, about one day at 5 s per ledger). A
+shorter window, a missing code entry or missing TTL metadata fails the run with
+an explicit error before any transaction is submitted. WeighIn does not extend
+TTLs, restore archived state or redeploy over an existing instance, so
+caller-owned state is never changed to hide an expiry. Extend the TTL
+externally or use a different deployer key.
 Upload and creation transactions are real submitted transactions. A generated
 private deployer key is shared across BASE/HEAD in a private temporary file.
 Submission classifies the RPC `sendTransaction` status before polling: `ERROR`
@@ -116,8 +124,9 @@ consumed CPU/memory. The helper's consumed cost-model values supply compute;
 RPC/native resource data supplies audited IO/events. No adjusted instruction
 budget is substituted for consumption.
 
-`src/measurement.ts::metricsFromSimulation` emits schema 4: eight measured resource fields and three
-unavailable fields with null values/reasons. Caps are decoded from the same
+`src/measurement.ts::metricsFromSimulation` emits schema 5: eight measured resource fields and three
+unavailable fields with null values/reasons. Per-metric source/cap labels are
+validated against approved mappings. Caps are decoded from the same
 captured configuration; event count has no independent cap. Exact definitions
 and source locations are in [metric provenance](metric-provenance.md).
 
@@ -126,12 +135,20 @@ ledger, input/header/snapshot/full-config hashes, compute calibration and resour
 limit hashes. Different invocation snapshots may use different ledgers. This
 records environment differences; it does not freeze state across the suite.
 
+The provenance also records the invoking source account. `src/measurement.ts`
+accepts an optional `invocationSourceAccount` for a single measured run, and
+`src/source-account.ts::measureSourceAccountEffects` measures one case under
+several source accounts while code, arguments, protocol, calibration and
+resource limits stay fixed. It refuses to report an effect when any held-fixed
+value differs and states whether the results stay comparable across accounts.
+See [source-account effects](source-account-effects.md).
+
 ## Diff and policy
 
 `src/record-schema.ts` provides the authoritative versioned schema and standalone
 runtime validator (`validateMeasurementRecord`, `validateMeasurementRecords`,
 `inspectMeasurementRecords`, and `getMeasurementRecordJsonSchema`) for saved
-measurement envelopes (`legacy`, `2`, `3`, and `4`; see
+measurement envelopes (`legacy`, `2`, `3`, `4`, and `5`; see
 [record schema](record-schema.md)). `src/diff.ts::diffBenchmarks` delegates record
 validation to `src/record-schema.ts`, validating all records including unmatched
 ones. Contracts pair by fixture/logical identity, invocations by function/case
@@ -159,6 +176,16 @@ metric sources/caps, both revisions' provenance, deltas, additions/removals and
 violations. `src/report.ts` writes optional Markdown and PR metadata; metadata
 is written only for PR events. The same report goes to `GITHUB_STEP_SUMMARY`.
 
+The Markdown report is delivered atomically. `src/report.ts` writes the complete
+body to a temporary file it creates exclusively (`O_CREAT | O_EXCL`) in the
+destination directory, closes that handle and renames the temporary file over
+the destination. The destination is therefore replaced only after a complete
+write, so a failed or interrupted delivery keeps a previously published report
+and never publishes a partial one. Cleanup removes only the temporary file the
+failing run created; a concurrent writer's temporary file is never touched. A
+cleanup failure is reported as a warning and never masks the original write or
+rename error.
+
 The PR metadata artifact is versioned (`src/pr-metadata.ts`). The producer writes
 `schemaVersion`, the base `repository`, `prNumber` and `headSha`; a fork PR still
 records the base repository. The consumer validates the version, repository
@@ -167,6 +194,8 @@ PR number and 40-character hexadecimal SHA before any API mutation. Legacy
 unversioned metadata is explicitly rejected rather than inferred, so producer and
 consumer versions must be paired.
 
+Before posting, the consumer (`src/comment-action.ts`, using `src/pr-freshness.ts`) compares the trusted `workflow_run.head_sha` with the live pull request head and skips a stale report with a visible reason. The artifact's `headSha` is only a consistency check: on `pull_request` events the producer measures the synthetic merge commit, so it must equal the run head or be a merge commit having it as a parent. It is never the trust anchor.
+
 The Action emits `result` and `diff-json` before failing a valid policy violation.
 It retains a validated diff if a later report-file or job-summary write fails,
 while preserving the delivery error as the failure diagnostic. Failures before a
@@ -174,11 +203,13 @@ valid comparison emit `fail` and `{}`; they never reuse a diff from another run.
 There is no successful no-baseline fallback. Optional direct-comment failure is
 warning-only.
 
-The separate `comment/` Action runs `bundled/comment-action.js`, reads and
-validates downloaded report/PR metadata, and creates or updates the comment
-carrying `<!-- weighin-report -->`. It fails on missing artifacts, invalid
-metadata or API failure. The example consumer runs only after successful PR
-producers, on trusted default-branch workflow code; it does not execute
-downloaded PR code. Failed policy reports remain in producer artifacts and
-summaries. Hosted expected-negative proof jobs separately assert genuine Action
-exit 1, then finish green once verified.
+The separate `comment/` Action runs `bundled/comment-action.js` resolved from
+the Action installation, independently of the caller's current working
+directory. Report and metadata paths are resolved from the caller's working
+directory. It reads and validates downloaded report/PR metadata, then creates or
+updates the comment carrying `<!-- weighin-report -->`. It fails on missing
+artifacts, invalid metadata or API failure. The example consumer runs only after
+successful PR producers, on trusted default-branch workflow code; it does not
+execute downloaded PR code. Failed policy reports remain in producer artifacts
+and summaries. Hosted expected-negative proof jobs separately assert genuine
+Action exit 1, then finish green once verified.

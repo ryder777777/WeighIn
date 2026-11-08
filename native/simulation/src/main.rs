@@ -14,10 +14,10 @@ use soroban_simulation::{
     NetworkConfig,
 };
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     io::{self, Read},
     rc::Rc,
-    cell::RefCell,
 };
 
 #[derive(Deserialize)]
@@ -54,7 +54,9 @@ impl SnapshotSource for Snapshot {
         match self.entries.get(&bytes) {
             Some(entry) => Ok(entry.clone()),
             None => {
-                self.missing.borrow_mut().push(key.to_xdr_base64(DEFAULT_XDR_RW_LIMITS)?);
+                self.missing
+                    .borrow_mut()
+                    .push(key.to_xdr_base64(DEFAULT_XDR_RW_LIMITS)?);
                 Err((ScErrorType::Storage, ScErrorCode::MissingValue).into())
             }
         }
@@ -70,9 +72,21 @@ struct FailureEnvelope<'a> {
     message: String,
 }
 
-fn failure(status: &'static str, keys: Option<Vec<String>>, message: impl Into<String>) -> anyhow::Error {
-    let envelope = FailureEnvelope { protocol_version: 1, status, keys, message: message.into() };
-    println!("{}", serde_json::to_string(&envelope).expect("failure envelope serializes"));
+fn failure(
+    status: &'static str,
+    keys: Option<Vec<String>>,
+    message: impl Into<String>,
+) -> anyhow::Error {
+    let envelope = FailureEnvelope {
+        protocol_version: 1,
+        status,
+        keys,
+        message: message.into(),
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&envelope).expect("failure envelope serializes")
+    );
     anyhow::anyhow!("native helper failure")
 }
 
@@ -82,14 +96,46 @@ fn same_xdr<T: WriteXdr>(left: &T, right: &T) -> bool {
 
 fn validate_correspondence(key: &LedgerKey, data: &LedgerEntryData) -> Result<()> {
     match (key, data) {
-        (LedgerKey::Account(k), LedgerEntryData::Account(d)) if same_xdr(&k.account_id, &d.account_id) => Ok(()),
-        (LedgerKey::Trustline(k), LedgerEntryData::Trustline(d)) if same_xdr(&k.account_id, &d.account_id) && same_xdr(&k.asset, &d.asset) => Ok(()),
-        (LedgerKey::Offer(k), LedgerEntryData::Offer(d)) if same_xdr(&k.seller_id, &d.seller_id) && k.offer_id == d.offer_id => Ok(()),
-        (LedgerKey::Data(k), LedgerEntryData::Data(d)) if same_xdr(&k.account_id, &d.account_id) && k.data_name == d.data_name => Ok(()),
-        (LedgerKey::ClaimableBalance(k), LedgerEntryData::ClaimableBalance(d)) if k.balance_id == d.balance_id => Ok(()),
-        (LedgerKey::ContractData(k), LedgerEntryData::ContractData(d)) if same_xdr(&k.contract, &d.contract) && same_xdr(&k.key, &d.key) && k.durability == d.durability => Ok(()),
-        (LedgerKey::ContractCode(k), LedgerEntryData::ContractCode(d)) if k.hash == d.hash => Ok(()),
-        (LedgerKey::ConfigSetting(k), LedgerEntryData::ConfigSetting(d)) if k.config_setting_id == d.discriminant() => Ok(()),
+        (LedgerKey::Account(k), LedgerEntryData::Account(d))
+            if same_xdr(&k.account_id, &d.account_id) =>
+        {
+            Ok(())
+        }
+        (LedgerKey::Trustline(k), LedgerEntryData::Trustline(d))
+            if same_xdr(&k.account_id, &d.account_id) && same_xdr(&k.asset, &d.asset) =>
+        {
+            Ok(())
+        }
+        (LedgerKey::Offer(k), LedgerEntryData::Offer(d))
+            if same_xdr(&k.seller_id, &d.seller_id) && k.offer_id == d.offer_id =>
+        {
+            Ok(())
+        }
+        (LedgerKey::Data(k), LedgerEntryData::Data(d))
+            if same_xdr(&k.account_id, &d.account_id) && k.data_name == d.data_name =>
+        {
+            Ok(())
+        }
+        (LedgerKey::ClaimableBalance(k), LedgerEntryData::ClaimableBalance(d))
+            if k.balance_id == d.balance_id =>
+        {
+            Ok(())
+        }
+        (LedgerKey::ContractData(k), LedgerEntryData::ContractData(d))
+            if same_xdr(&k.contract, &d.contract)
+                && same_xdr(&k.key, &d.key)
+                && k.durability == d.durability =>
+        {
+            Ok(())
+        }
+        (LedgerKey::ContractCode(k), LedgerEntryData::ContractCode(d)) if k.hash == d.hash => {
+            Ok(())
+        }
+        (LedgerKey::ConfigSetting(k), LedgerEntryData::ConfigSetting(d))
+            if k.config_setting_id == d.discriminant() =>
+        {
+            Ok(())
+        }
         (LedgerKey::Ttl(k), LedgerEntryData::Ttl(d)) if k.key_hash == d.key_hash => Ok(()),
         _ => bail!("ledger entry/key correspondence mismatch"),
     }
@@ -111,6 +157,24 @@ fn run() -> Result<()> {
     let mut map = BTreeMap::new();
     for row in input.entries {
         let key = LedgerKey::from_xdr_base64(&row.key, DEFAULT_XDR_RW_LIMITS)?;
+        // An absent row records that the key does not exist; metadata that only
+        // a present entry can have makes the row contradictory, not absent.
+        if row.xdr.is_none() {
+            let present_only: Vec<&str> = [
+                ("extension_xdr", row.extension_xdr.is_some()),
+                ("last_modified", row.last_modified.is_some()),
+                ("live_until", row.live_until.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(field, set)| set.then_some(field))
+            .collect();
+            if !present_only.is_empty() {
+                bail!(
+                    "absent snapshot entry must not carry {}",
+                    present_only.join(", ")
+                );
+            }
+        }
         if row.live_until.is_some_and(|ttl| ttl < header.ledger_seq) {
             bail!("archived ledger state is unsupported");
         }
@@ -143,7 +207,10 @@ fn run() -> Result<()> {
             bail!("duplicate snapshot key");
         }
     }
-    let snapshot = Rc::new(Snapshot { entries: map, missing: RefCell::new(Vec::new()) });
+    let snapshot = Rc::new(Snapshot {
+        entries: map,
+        missing: RefCell::new(Vec::new()),
+    });
     let config = NetworkConfig::load_from_snapshot(snapshot.as_ref())
         .context("incomplete/invalid network configuration")?;
     let mut ledger = LedgerInfo {
@@ -184,9 +251,17 @@ fn run() -> Result<()> {
         Err(err) => {
             let missing = snapshot.missing.borrow().clone();
             if !missing.is_empty() {
-                return Err(failure("uncaptured", Some(missing), "snapshot is missing ledger keys"));
+                return Err(failure(
+                    "uncaptured",
+                    Some(missing),
+                    "snapshot is missing ledger keys",
+                ));
             }
-            return Err(failure("host_failure", None, format!("host invocation failed: {err:?}")));
+            return Err(failure(
+                "host_failure",
+                None,
+                format!("host invocation failed: {err:?}"),
+            ));
         }
     };
     let txdata = result
